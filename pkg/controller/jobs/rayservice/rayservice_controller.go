@@ -26,7 +26,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -52,16 +51,18 @@ const (
 	FrameworkName       = "ray.io/rayservice"
 )
 
-func init() {
-	utilruntime.Must(jobframework.RegisterIntegration(FrameworkName, jobframework.IntegrationCallbacks{
-		SetupIndexes:      SetupIndexes,
-		NewJob:            newJob,
-		NewReconciler:     NewReconciler,
-		SetupWebhook:      SetupRayServiceWebhook,
-		JobType:           &rayv1.RayService{},
-		AddToScheme:       rayv1.AddToScheme,
-		MultiKueueAdapter: ray.NewMKAdapter(copyJobSpec, copyJobStatus, getEmptyList, gvk, getManagedBy, setManagedBy),
-	}))
+func RegisterIntegration(m *jobframework.IntegrationManager) error {
+	return m.RegisterIntegration(FrameworkName, jobframework.IntegrationCallbacks{
+		SetupIndexes:  SetupIndexes,
+		NewJob:        newJob,
+		NewReconciler: NewReconciler,
+		SetupWebhook:  SetupRayServiceWebhook,
+		JobType:       &rayv1.RayService{},
+		AddToScheme:   rayv1.AddToScheme,
+		MultiKueueAdapter: ray.NewMKAdapter(copyJobSpec, copyJobStatus, getEmptyList, gvk, getManagedBy, setManagedBy,
+			ray.WithRemoteSpecSync[*rayv1.RayService, rayv1.RayService](remoteSpecSyncer{}),
+		),
+	})
 }
 
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;watch;update;patch
@@ -126,6 +127,7 @@ var _ jobframework.GenericJob = (*RayService)(nil)
 var _ jobframework.JobWithCustomAnnotations = (*RayService)(nil)
 var _ jobframework.JobWithManagedBy = (*RayService)(nil)
 var _ jobframework.ElasticWorkloadNameProvider = (*RayService)(nil)
+var _ jobframework.JobWithSkip = (*RayService)(nil)
 
 func (j *RayService) Object() client.Object {
 	return (*rayv1.RayService)(j)
@@ -141,6 +143,17 @@ func (j *RayService) IsActive() bool {
 
 func (j *RayService) Suspend() {
 	j.Spec.RayClusterSpec.Suspend = new(true)
+}
+
+// If GCS fault tolerance is enabled, a Redis cleanup K8s Job may be created to clean up the RayCluster's Redis namespace.
+// Defer the finalization of the RayService's Workload until the cleanup Job completes, to avoid the Redis cleanup Job hanging.
+//
+// TODO(#12820): this is gated by DeferRayServiceFinalizationForRedisCleanup as a temporary workaround. Remove the gate
+// once the generic FinishOrphanedWorkloads owner-deletion check lands.
+func (j *RayService) Skip(context.Context) bool {
+	return features.Enabled(features.DeferRayServiceFinalizationForRedisCleanup) &&
+		!j.DeletionTimestamp.IsZero() &&
+		rayutils.IsGCSFaultToleranceEnabled(&j.Spec.RayClusterSpec, j.Annotations)
 }
 
 func (j *RayService) GVK() schema.GroupVersionKind {
@@ -179,7 +192,7 @@ func (j *RayService) RunWithPodSetsInfo(ctx context.Context, _ client.Client, po
 	j.Spec.RayClusterSpec.Suspend = new(false)
 
 	rayClusterSpec := &j.Spec.RayClusterSpec
-	err := raycluster.UpdateRayClusterSpecToRunWithPodSetsInfo(rayClusterSpec, podSetsInfo)
+	err := raycluster.UpdateRayClusterSpecToRunWithPodSetsInfo(ctrl.LoggerFrom(ctx), rayClusterSpec, podSetsInfo)
 	if err != nil {
 		return err
 	}
@@ -187,12 +200,8 @@ func (j *RayService) RunWithPodSetsInfo(ctx context.Context, _ client.Client, po
 	return nil
 }
 
-func (j *RayService) RestorePodSetsInfo(podSetsInfo []podset.PodSetInfo) bool {
-	if len(podSetsInfo) != raycluster.ExpectedPodSetsCount(&j.Spec.RayClusterSpec) {
-		return false
-	}
-
-	return raycluster.RestorePodSetsInfo(&j.Spec.RayClusterSpec, podSetsInfo)
+func (j *RayService) RestorePodSetsInfo(ctx context.Context, podSetsInfo []podset.PodSetInfo) bool {
+	return raycluster.RestorePodSetsInfo(ctx, &j.Spec.RayClusterSpec, podSetsInfo)
 }
 
 func (j *RayService) Finished(ctx context.Context) (message string, success, finished bool) {
@@ -223,8 +232,8 @@ func (j *RayService) PodsReady(ctx context.Context, _ client.Client) bool {
 	return meta.IsStatusConditionTrue(j.Status.Conditions, string(rayv1.RayServiceReady))
 }
 
-func (j *RayService) GetCustomAnnotations(ctx context.Context, c client.Client, podSets []kueue.PodSet) (map[string]string, error) {
-	return raycluster.GetWorkloadslicingRayClusterCustomAnnotations(ctx, c, j.Object(), podSets, j.Status.ActiveServiceStatus.RayClusterName)
+func (j *RayService) GetCustomAnnotations(ctx context.Context, c client.Client) (map[string]string, error) {
+	return raycluster.GetWorkloadslicingRayClusterCustomAnnotations(ctx, c, j.Object(), j.Status.ActiveServiceStatus.RayClusterName)
 }
 
 func (j *RayService) GetWorkloadNameExtraPart() string {

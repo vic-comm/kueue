@@ -26,8 +26,33 @@ import (
 
 type TopologyDomainID string
 
+const topologyDomainIDSeparator = ","
+
 func DomainID(levelValues []string) TopologyDomainID {
-	return TopologyDomainID(strings.Join(levelValues, ","))
+	return TopologyDomainID(strings.Join(levelValues, topologyDomainIDSeparator))
+}
+
+// BelongsTo reports whether d identifies targetDomain itself or one of its
+// descendants.
+func (d TopologyDomainID) BelongsTo(targetDomain TopologyDomainID) bool {
+	if targetDomain == "" {
+		return true
+	}
+	return d == targetDomain || strings.HasPrefix(string(d), string(targetDomain)+topologyDomainIDSeparator)
+}
+
+// NodeNameFromDomainID returns the node name identified by the domain ID. It
+// reports false when the domain does not identify a single node, i.e. when the
+// lowest level of levels is not the hostname label.
+//
+// When the hostname is the lowest level, an assignment is built for that level
+// alone, so the domain ID holds the node name verbatim with no level values
+// concatenated into it.
+func NodeNameFromDomainID(levels []string, domainID TopologyDomainID) (string, bool) {
+	if len(levels) == 0 || !IsLowestLevelHostname(levels) {
+		return "", false
+	}
+	return string(domainID), true
 }
 
 func IsTAS(pod *corev1.Pod) bool {
@@ -54,6 +79,18 @@ func IsExplicitTAS(annots map[string]string) bool {
 		return true
 	}
 	return false
+}
+
+// HasTopologyConstraint reports whether the request contains a field that
+// explicitly opts the PodSet into topology-aware scheduling. Derived indexing
+// fields alone don't constitute a topology constraint.
+func HasTopologyConstraint(tr *kueue.PodSetTopologyRequest) bool {
+	return tr != nil && (tr.Unconstrained != nil ||
+		tr.Required != nil ||
+		tr.Preferred != nil ||
+		tr.PodSetSliceRequiredTopology != nil ||
+		tr.PodSetSliceSize != nil ||
+		len(tr.PodsetSliceRequiredTopologyConstraints) > 0)
 }
 
 func NodeLabelsFromKeysAndValues(keys, values []string) map[string]string {
@@ -101,4 +138,33 @@ func GetNodeCondition(node *corev1.Node, conditionType corev1.NodeConditionType)
 // IsLowestLevelHostname checks if the lowest (last) level in the provided topology levels is node
 func IsLowestLevelHostname(levels []string) bool {
 	return levels[len(levels)-1] == corev1.LabelHostname
+}
+
+// PodSetSliceRequiredTopologyConstraints returns the unified slice topology
+// constraints for a PodSetTopologyRequest, regardless of whether they were
+// specified via the new multi-layer PodsetSliceRequiredTopologyConstraints
+// annotation or the old single-layer PodSetSliceRequiredTopology/
+// PodSetSliceSize fields.
+//
+// This is necessary to handle Workload objects that were persisted before the
+// unification, which only populate the legacy fields. Callers should use this
+// function instead of reading PodsetSliceRequiredTopologyConstraints directly
+// to ensure both annotation forms are handled consistently.
+func PodSetSliceRequiredTopologyConstraints(tr *kueue.PodSetTopologyRequest) []kueue.PodsetSliceRequiredTopologyConstraint {
+	if tr == nil {
+		return nil
+	}
+	if len(tr.PodsetSliceRequiredTopologyConstraints) > 0 {
+		return tr.PodsetSliceRequiredTopologyConstraints
+	}
+	if tr.PodSetSliceRequiredTopology == nil {
+		return nil
+	}
+	size := int32(0)
+	if tr.PodSetSliceSize != nil {
+		size = *tr.PodSetSliceSize
+	}
+	return []kueue.PodsetSliceRequiredTopologyConstraint{
+		{Topology: *tr.PodSetSliceRequiredTopology, Size: size},
+	}
 }

@@ -21,7 +21,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/kueue/pkg/controller/constants"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
@@ -63,9 +62,9 @@ func MakeService(name, ns string) *ServiceWrapper {
 				WorkerGroupSpecs: []rayv1.WorkerGroupSpec{
 					{
 						GroupName:      "workers-group-0",
-						Replicas:       ptr.To[int32](1),
-						MinReplicas:    ptr.To[int32](0),
-						MaxReplicas:    ptr.To[int32](10),
+						Replicas:       new(int32(1)),
+						MinReplicas:    new(int32(0)),
+						MaxReplicas:    new(int32(10)),
 						RayStartParams: map[string]string{},
 						Template: corev1.PodTemplateSpec{
 							Spec: corev1.PodSpec{
@@ -209,6 +208,16 @@ func (j *ServiceWrapper) WithServeConfigV2(config string) *ServiceWrapper {
 	return j
 }
 
+// GCSFaultTolerance enables GCS fault tolerance backed by the Redis instance at
+// redisAddress. On deletion KubeRay runs a Redis cleanup Job to purge the RayCluster's
+// GCS metadata namespace.
+func (j *ServiceWrapper) GCSFaultTolerance(redisAddress string) *ServiceWrapper {
+	j.Spec.RayClusterSpec.GcsFaultToleranceOptions = &rayv1.GcsFaultToleranceOptions{
+		RedisAddress: redisAddress,
+	}
+	return j
+}
+
 // Clone returns a deep copy of the RayService.
 func (j *ServiceWrapper) Clone() *ServiceWrapper {
 	return &ServiceWrapper{*j.DeepCopy()}
@@ -282,6 +291,11 @@ func (j *ServiceWrapper) EnableInTreeAutoscaling() *ServiceWrapper {
 		UpscalingMode:      &aggressive,
 		IdleTimeoutSeconds: &idleTimeoutSeconds,
 	}
+	return j
+}
+
+func (j *ServiceWrapper) WithHistoryServerOptions(value *rayv1.HistoryServerOptions) *ServiceWrapper {
+	j.Spec.RayClusterSpec.HistoryServerOptions = value
 	return j
 }
 

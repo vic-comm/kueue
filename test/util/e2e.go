@@ -21,8 +21,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,8 +55,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-	"k8s.io/client-go/tools/portforward"
-	"k8s.io/client-go/transport/spdy"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	inventoryv1alpha1 "sigs.k8s.io/cluster-inventory-api/apis/v1alpha1"
@@ -69,7 +65,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
-	kueuev1beta1 "sigs.k8s.io/kueue/apis/kueue/v1beta1"
+	kueuealpha "sigs.k8s.io/kueue/apis/kueue/v1alpha1"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	visibility "sigs.k8s.io/kueue/apis/visibility/v1beta2"
 	kueueclientset "sigs.k8s.io/kueue/client-go/clientset/versioned"
@@ -112,6 +108,10 @@ func GetAgnHostImage() string {
 
 func GetSparkTestImage() string {
 	return getCachedDockerImage(&sparkTestImageOnce, &sparkTestImage, "E2E_TEST_SPARK_IMAGE", "spark")
+}
+
+func GetRedisTestImage() string {
+	return getCachedDockerImage(&redisTestImageOnce, &redisTestImage, "E2E_TEST_REDIS_IMAGE", "redis")
 }
 
 // getCachedDockerImage resolves a test image exactly once via the supplied sync.Once,
@@ -199,9 +199,8 @@ func CreateClientUsingCluster(kContext string) (client.WithWatch, *rest.Config, 
 	err = cmv1.AddToScheme(scheme.Scheme)
 	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
 
-	err = kueuev1beta1.AddToScheme(scheme.Scheme)
+	err = kueuealpha.AddToScheme(scheme.Scheme)
 	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
-
 	err = visibility.AddToScheme(scheme.Scheme)
 	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
 
@@ -546,9 +545,7 @@ func WaitForActivePodsAndTerminate(
 		activePods = make([]corev1.Pod, 0)
 		for _, p := range pods.Items {
 			if len(p.Status.PodIP) != 0 && p.Status.Phase == corev1.PodRunning {
-				cmd := []string{"/bin/sh", "-c", fmt.Sprintf("curl \"http://%s:8080/readyz\"", p.Status.PodIP)}
-				_, _, err := KExecute(ctx, cfg, restClient, namespace, p.Name, p.Spec.Containers[0].Name, cmd)
-				g.Expect(err).ToNot(gomega.HaveOccurred())
+				g.Expect(curlAgnHost(ctx, cfg, restClient, &p, "readyz")).To(gomega.Succeed())
 				activePods = append(activePods, p)
 			}
 		}
@@ -557,17 +554,49 @@ func WaitForActivePodsAndTerminate(
 
 	for _, p := range activePods {
 		ginkgo.GinkgoLogr.Info("Terminating pod", "pod", klog.KObj(&p))
-		cmd := []string{"/bin/sh", "-c", fmt.Sprintf("curl \"http://%s:8080/exit?code=%v&timeout=2s&wait=2s\"", p.Status.PodIP, exitCode)}
-		_, _, err := KExecute(ctx, cfg, restClient, namespace, p.Name, p.Spec.Containers[0].Name, cmd)
-		// TODO: remove the custom handling of 137 response once this is fixed in the agnhost image
-		// We add the custom handling to protect in situation when the target pods completes with the expected
-		// exit code but it terminates before it completes sending the response.
-		if err != nil {
-			gomega.ExpectWithOffset(1, err.Error()).To(gomega.ContainSubstring("137"))
-		} else {
-			gomega.ExpectWithOffset(1, err).ToNot(gomega.HaveOccurred())
-		}
+		gomega.ExpectWithOffset(1, exitAgnHost(ctx, cfg, restClient, &p, exitCode)).To(gomega.Succeed())
 	}
+}
+
+// RestartPodContainer terminates the first container of a running agnhost pod and relies on RestartPolicyAlways to restart it.
+func RestartPodContainer(
+	ctx context.Context,
+	k8sClient client.Client,
+	restClient *rest.RESTClient,
+	cfg *rest.Config,
+	key client.ObjectKey,
+) {
+	ginkgo.GinkgoHelper()
+	pod := &corev1.Pod{}
+	gomega.Eventually(func(g gomega.Gomega) {
+		g.Expect(k8sClient.Get(ctx, key, pod)).To(gomega.Succeed())
+		g.Expect(pod.Status.Phase).To(gomega.Equal(corev1.PodRunning))
+		g.Expect(pod.Status.PodIP).NotTo(gomega.BeEmpty())
+		g.Expect(curlAgnHost(ctx, cfg, restClient, pod, "readyz")).To(gomega.Succeed())
+	}, LongTimeout, Interval).Should(gomega.Succeed())
+	gomega.Expect(pod.Spec.RestartPolicy).To(gomega.Equal(corev1.RestartPolicyAlways),
+		"RestartPodContainer only restarts a container under the Always restart policy")
+
+	ginkgo.GinkgoLogr.Info("Restarting pod container", "pod", klog.KObj(pod), "container", pod.Spec.Containers[0].Name)
+	gomega.Expect(exitAgnHost(ctx, cfg, restClient, pod, 0)).To(gomega.Succeed())
+}
+
+func curlAgnHost(ctx context.Context, cfg *rest.Config, restClient *rest.RESTClient, pod *corev1.Pod, path string) error {
+	cmd := []string{"/bin/sh", "-c", fmt.Sprintf("curl \"http://%s:8080/%s\"", pod.Status.PodIP, path)}
+	_, _, err := KExecute(ctx, cfg, restClient, pod.Namespace, pod.Name, pod.Spec.Containers[0].Name, cmd)
+	return err
+}
+
+func exitAgnHost(ctx context.Context, cfg *rest.Config, restClient *rest.RESTClient, pod *corev1.Pod, exitCode int) error {
+	cmd := []string{"/bin/sh", "-c", fmt.Sprintf("curl \"http://%s:8080/exit?code=%v&timeout=2s&wait=2s\"", pod.Status.PodIP, exitCode)}
+	_, _, err := KExecute(ctx, cfg, restClient, pod.Namespace, pod.Name, pod.Spec.Containers[0].Name, cmd)
+	// TODO: remove the custom handling of 137 response once this is fixed in the agnhost image
+	// We add the custom handling to protect in situation when the target pods completes with the expected
+	// exit code but it terminates before it completes sending the response.
+	if err != nil && strings.Contains(err.Error(), "137") {
+		return nil
+	}
+	return err
 }
 
 func WaitForKueueAvailabilityNoRestartCountCheck(ctx context.Context, k8sClient client.Client) {
@@ -595,7 +624,7 @@ func ForceLeaderFailover(ctx context.Context, k8sClient client.Client) {
 
 	holderIdentity := ptr.Deref(lease.Spec.HolderIdentity, "")
 	gomega.Expect(holderIdentity).NotTo(gomega.BeEmpty(), "expected a current leader to be elected")
-	leaderPodName := strings.SplitN(holderIdentity, "_", 2)[0]
+	leaderPodName, _, _ := strings.Cut(holderIdentity, "_")
 
 	ginkgo.By(fmt.Sprintf("Deleting leader pod %q to force failover", leaderPodName))
 	leaderPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: kueueNS, Name: leaderPodName}}
@@ -794,59 +823,6 @@ func CreatePrometheusClient(cfg *rest.Config) prometheusv1.API {
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 	return prometheusv1.NewAPI(client)
-}
-
-// KPortForward establishes a port-forward connection to a pod and returns
-// the local port, a stop channel to close the connection, and any error.
-func KPortForward(cfg *rest.Config, restClient *rest.RESTClient, ns, podName string, remotePort int) (int, chan struct{}, error) {
-	// Build the URL to the pod's portforward endpoint
-	url := restClient.Post().
-		Resource("pods").
-		Namespace(ns).
-		Name(podName).
-		SubResource("portforward").
-		URL()
-
-	// Create SPDY transport
-	transport, upgrader, err := spdy.RoundTripperFor(cfg)
-	if err != nil {
-		return 0, nil, fmt.Errorf("creating SPDY round tripper: %w", err)
-	}
-
-	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", url)
-
-	// Setup channels
-	stopChan := make(chan struct{})
-	readyChan := make(chan struct{})
-
-	// Use port 0 so the OS atomically assigns a free local port, avoiding the
-	// TOCTOU race of finding a port and then trying to bind it separately.
-	ports := []string{fmt.Sprintf("0:%d", remotePort)}
-
-	// Create port forwarder
-	pf, err := portforward.New(dialer, ports, stopChan, readyChan, io.Discard, io.Discard)
-	if err != nil {
-		return 0, nil, fmt.Errorf("creating port forwarder: %w", err)
-	}
-
-	// Run in goroutine
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- pf.ForwardPorts()
-	}()
-
-	// Wait for ready or error
-	select {
-	case <-readyChan:
-		forwardedPorts, err := pf.GetPorts()
-		if err != nil {
-			close(stopChan)
-			return 0, nil, fmt.Errorf("getting forwarded ports: %w", err)
-		}
-		return int(forwardedPorts[0].Local), stopChan, nil
-	case err := <-errChan:
-		return 0, nil, fmt.Errorf("port forward failed: %w", err)
-	}
 }
 
 func SetResourceNominalQuota(cq *kueue.ClusterQueue, resourceName corev1.ResourceName, value string) *kueue.ClusterQueue {
